@@ -120,6 +120,8 @@ from qdrant_client.local.sparse_distances import (
 )
 
 DEFAULT_VECTOR_NAME = ""
+# https://github.com/qdrant/qdrant/blob/0beaf512a213b0e25cee06087b08fd94ffea45f2/lib/segment/src/types.rs#L2409
+DEFAULT_SPARSE_FULL_SCAN_THRESHOLD = 5_000
 EPSILON = 1.1920929e-7  # https://doc.rust-lang.org/std/f32/constant.EPSILON.html
 # https://github.com/qdrant/qdrant/blob/7164ac4a5987d28f1c93f5712aef8e09e7d93555/lib/segment/src/spaces/simple_avx.rs#L99C10-L99C10
 
@@ -873,6 +875,21 @@ class LocalCollection:
 
         mask = self._payload_and_non_deleted_mask(query_filter, vector_name=name)
 
+        # Same as the server: sparse nearest search drops exact 0.0 scores on its inverted index
+        # path, which it takes unless a filter matches fewer points than `full_scan_threshold`.
+        # Other sparse queries are scored in full and keep them.
+        skip_zero_scores = False
+        if isinstance(query_vector, SparseVector):
+            sparse_index = self.config.sparse_vectors[name].index
+            full_scan_threshold = (
+                sparse_index.full_scan_threshold
+                if sparse_index is not None and sparse_index.full_scan_threshold is not None
+                else DEFAULT_SPARSE_FULL_SCAN_THRESHOLD
+            )
+            skip_zero_scores = (
+                query_filter is None or np.count_nonzero(mask) >= full_scan_threshold
+            )
+
         required_order = distance_to_order(distance)
 
         if required_order == DistanceOrder.BIGGER_IS_BETTER or isinstance(
@@ -903,6 +920,8 @@ class LocalCollection:
             score = scores[idx]
             # skip undefined scores from sparse vectors
             if sparse_scoring and score == -np.inf:
+                continue
+            if skip_zero_scores and score == 0.0:
                 continue
             point_id = self.ids_inv[idx]
 
@@ -1439,9 +1458,15 @@ class LocalCollection:
             # the original object, if users want to reuse it somehow
             set_prefetch_limit_iteratively(prefetch, max_limit)
 
+        # Same as the server: only points with the `group_by` key are candidates. The filter also
+        # decides whether a sparse nearest search keeps 0.0 scores, see `search`.
+        key_not_empty = models.Filter(
+            must_not=[models.IsEmptyCondition(is_empty=models.PayloadField(key=group_by))]
+        )
+
         points = self.query_points(
             query=query,
-            query_filter=query_filter,
+            query_filter=_merge_filters(query_filter, key_not_empty),
             prefetch=prefetch,
             using=using,
             limit=len(self.ids_inv),

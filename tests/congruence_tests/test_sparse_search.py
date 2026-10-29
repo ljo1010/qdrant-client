@@ -11,6 +11,7 @@ from tests.congruence_tests.test_common import (
     init_client,
     init_local,
     init_remote,
+    initialize_fixture_collection,
     sparse_image_vector_size,
     sparse_text_vector_size,
     sparse_vectors_config,
@@ -358,3 +359,152 @@ def test_query_with_nan():
         remote_client.query_points(
             COLLECTION_NAME, sparse_vector["sparse-text"], using="sparse-text"
         )
+
+
+ZERO_SCORE_QUERY = models.SparseVector(indices=[1, 2], values=[1.0, 1.0])
+ZERO_SCORE_NUM_POINTS = 60
+
+
+def init_zero_score_collection(
+    client: QdrantBase, num_in: int, sparse_params: models.SparseVectorParams
+) -> None:
+    """Point 1 scores exactly 0.0 against `ZERO_SCORE_QUERY`, the others 2.0.
+
+    Points 1..num_in have tag="in", the rest tag="out".
+    """
+    initialize_fixture_collection(
+        client, vectors_config={}, sparse_vectors_config={"sparse-text": sparse_params}
+    )
+    client.create_payload_index(COLLECTION_NAME, "tag", models.PayloadSchemaType.KEYWORD)
+    client.upsert(
+        COLLECTION_NAME,
+        points=[
+            models.PointStruct(
+                id=i,
+                vector={
+                    "sparse-text": models.SparseVector(
+                        indices=[1, 2], values=[1.0, -1.0] if i == 1 else [1.0, 1.0]
+                    )
+                },
+                payload={"tag": "in" if i <= num_in else "out"},
+            )
+            for i in range(1, ZERO_SCORE_NUM_POINTS + 1)
+        ],
+        wait=True,
+    )
+
+
+@pytest.mark.parametrize("modifier", [None, models.Modifier.IDF])
+def test_zero_score_nearest_search(modifier: models.Modifier | None) -> None:
+    # The server drops exact 0.0 scores on its inverted index path: no filter, or a filter
+    # matching at least `full_scan_threshold` points. Smaller filters take the plain path,
+    # which keeps them.
+    in_filter = models.Filter(
+        must=[models.FieldCondition(key="tag", match=models.MatchValue(value="in"))]
+    )
+
+    def search(
+        client: QdrantBase, query_filter: models.Filter | None = None
+    ) -> list[models.ScoredPoint]:
+        return client.query_points(
+            COLLECTION_NAME,
+            query=ZERO_SCORE_QUERY,
+            using="sparse-text",
+            query_filter=query_filter,
+            limit=ZERO_SCORE_NUM_POINTS,
+        ).points
+
+    local_client = init_local()
+    remote_client = init_remote()
+    sparse_params = models.SparseVectorParams(
+        index=models.SparseIndexParams(full_scan_threshold=10), modifier=modifier
+    )
+
+    for num_in in (5, 60):
+        for client in (local_client, remote_client):
+            init_zero_score_collection(client, num_in, sparse_params)
+
+        compare_client_results(local_client, remote_client, search)
+        compare_client_results(local_client, remote_client, search, query_filter=in_filter)
+
+        assert 1 not in [point.id for point in search(local_client)]
+        filtered_ids = [point.id for point in search(local_client, in_filter)]
+        assert (1 in filtered_ids) == (num_in < 10)
+
+
+def test_zero_score_nearest_groups() -> None:
+    # The server only takes points with the `group_by` key as group candidates. That filter
+    # matches fewer points than the default `full_scan_threshold`, so 0.0 scores are kept.
+    def query_groups(client: QdrantBase) -> models.GroupsResult:
+        return client.query_points_groups(
+            COLLECTION_NAME,
+            query=ZERO_SCORE_QUERY,
+            using="sparse-text",
+            group_by="tag",
+            limit=2,
+            group_size=ZERO_SCORE_NUM_POINTS,
+        )
+
+    local_client = init_local()
+    remote_client = init_remote()
+    for client in (local_client, remote_client):
+        init_zero_score_collection(client, 5, models.SparseVectorParams())
+
+    compare_client_results(local_client, remote_client, query_groups)
+
+    hit_ids = [hit.id for group in query_groups(local_client).groups for hit in group.hits]
+    assert 1 in hit_ids
+
+
+def test_zero_score_recommend_and_context() -> None:
+    # Unlike nearest search, the server scores recommend and context queries against every
+    # point and keeps 0.0 scores.
+    def recommend_sum_scores(client: QdrantBase) -> list[models.ScoredPoint]:
+        return client.query_points(
+            COLLECTION_NAME,
+            query=models.RecommendQuery(
+                recommend=models.RecommendInput(
+                    positive=[1], strategy=models.RecommendStrategy.SUM_SCORES
+                )
+            ),
+            using="sparse-text",
+            limit=10,
+        ).points
+
+    def context(client: QdrantBase) -> list[models.ScoredPoint]:
+        return client.query_points(
+            COLLECTION_NAME,
+            query=models.ContextQuery(context=[models.ContextPair(positive=2, negative=3)]),
+            using="sparse-text",
+            limit=10,
+        ).points
+
+    vectors = {
+        1: models.SparseVector(indices=[1], values=[1.0]),
+        2: models.SparseVector(indices=[1], values=[1.0]),
+        3: models.SparseVector(indices=[9], values=[1.0]),
+        4: models.SparseVector(indices=[1, 2], values=[1.0, -1.0]),
+    }
+    local_client = init_local()
+    remote_client = init_remote()
+    for client in (local_client, remote_client):
+        initialize_fixture_collection(
+            client, vectors_config={}, sparse_vectors_config=sparse_vectors_config
+        )
+        client.upsert(
+            COLLECTION_NAME,
+            points=[
+                models.PointStruct(id=id_, vector={"sparse-text": vector})
+                for id_, vector in vectors.items()
+            ],
+            wait=True,
+        )
+
+    compare_client_results(local_client, remote_client, recommend_sum_scores)
+    compare_client_results(local_client, remote_client, context, is_context_search=True)
+
+    assert (3, 0.0) in [(point.id, point.score) for point in recommend_sum_scores(local_client)]
+    assert sorted((point.id, point.score) for point in context(local_client)) == [
+        (1, 0.0),
+        (4, 0.0),
+    ]
