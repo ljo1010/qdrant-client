@@ -887,7 +887,7 @@ class LocalCollection:
                 else DEFAULT_SPARSE_FULL_SCAN_THRESHOLD
             )
             skip_zero_scores = (
-                query_filter is None or np.count_nonzero(mask) >= full_scan_threshold
+                query_filter is None or int(np.count_nonzero(mask)) >= full_scan_threshold
             )
 
         required_order = distance_to_order(distance)
